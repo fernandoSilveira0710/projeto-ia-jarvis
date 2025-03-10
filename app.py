@@ -4,6 +4,8 @@ import numpy as np
 import whisper
 import sounddevice as sd
 import torch
+import os
+import pyautogui
 from queue import Queue
 from rich.console import Console
 from langchain.memory import ConversationBufferMemory
@@ -13,12 +15,12 @@ from langchain_community.llms import Ollama
 from tts import TextToSpeechService
 
 console = Console()
-stt = whisper.load_model("medium")  # Modelo Whisper para melhor precisão
+stt = whisper.load_model("medium")  # Melhor precisão
 tts = TextToSpeechService(device="cuda" if torch.cuda.is_available() else "cpu")
 
 template = """
-Você é um assistente de IA chamado Jarvis.
-Sempre me chame de "Meu querido" e fale apenas em português. A seguir está a pergunta.
+Você é um assistente de IA chamado Jarvis.  
+Me chame de Meu querido, fale sempre em português. Segue a pergunta:
 
 Histórico da conversa:
 {history}
@@ -29,74 +31,93 @@ Sua resposta:
 """
 
 PROMPT = PromptTemplate(input_variables=["history", "input"], template=template)
-
-# Configuração do modelo de IA para geração de resposta
-cadeia_conversacao = ConversationChain(
+chain = ConversationChain(
     prompt=PROMPT,
     verbose=False,
     memory=ConversationBufferMemory(ai_prefix="Assistente:"),
     llm=Ollama(model="mistral", base_url="http://localhost:11434"),
 )
 
+# Dicionário de comandos
+COMANDOS = {
+    "abrir bloco de notas": "notepad.exe",
+}
 
-def gravar_audio(evento_parar, fila_dados):
+def executar_comando(comando):
     """
-    Captura áudio do microfone do usuário e adiciona à fila para processamento.
+    Executa comandos do sistema operacional.
+    """
+    if comando in COMANDOS:
+        os.system(COMANDOS[comando])  # Abre o aplicativo correspondente
+        time.sleep(1)  # Espera o bloco de notas abrir
+        return True
+    return False
+
+
+def record_audio(stop_event, data_queue):
+    """
+    Captura áudio do microfone e armazena na fila para processamento.
 
     Args:
-        evento_parar (threading.Event): Sinaliza quando a gravação deve ser interrompida.
-        fila_dados (queue.Queue): Fila onde os dados de áudio gravados serão armazenados.
+        stop_event (threading.Event): Evento para parar a gravação.
+        data_queue (queue.Queue): Fila onde os dados do áudio são armazenados.
+
+    Returns:
+        None
     """
-    def callback(indata, frames, tempo, status):
+    def callback(indata, frames, time, status):
         if status:
             console.print(status)
-        fila_dados.put(bytes(indata))
+        data_queue.put(bytes(indata))
 
     with sd.RawInputStream(samplerate=16000, dtype="int16", channels=1, callback=callback):
-        while not evento_parar.is_set():
+        while not stop_event.is_set():
             time.sleep(0.1)
 
 
-def transcrever(audio_np: np.ndarray) -> str:
+def transcribe(audio_np: np.ndarray) -> str:
     """
-    Transcreve o áudio utilizando o modelo Whisper.
+    Transcreve o áudio capturado usando Whisper.
 
     Args:
-        audio_np (numpy.ndarray): Dados de áudio a serem transcritos.
+        audio_np (numpy.ndarray): Dados de áudio.
 
     Returns:
         str: Texto transcrito.
     """
-    resultado = stt.transcribe(audio_np, fp16=False, language="pt")  # Transcrição em PT-BR
-    texto = resultado["text"].strip()
-    return texto
+    result = stt.transcribe(audio_np, fp16=False, language="pt")  # Forçar PT
+    text = result["text"].strip()
+    return text
 
 
-def gerar_resposta_ia(texto: str) -> str:
+def get_llm_response(text: str) -> str:
     """
-    Gera uma resposta com base no texto fornecido usando o modelo de IA.
+    Gera resposta baseada no texto fornecido.
 
     Args:
-        texto (str): Texto de entrada.
+        text (str): Entrada do usuário.
 
     Returns:
-        str: Resposta gerada pela IA.
+        str: Resposta gerada pelo LLM.
     """
-    resposta = cadeia_conversacao.predict(input=texto)
-    if resposta.startswith("Assistente:"):
-        resposta = resposta[len("Assistente:") :].strip()
-    return resposta
+    response = chain.predict(input=text)
+    if response.startswith("Assistente:"):
+        response = response[len("Assistente:") :].strip()
+    return response
 
 
-def reproduzir_audio(taxa_amostragem, dados_audio):
+def play_audio(sample_rate, audio_array):
     """
-    Reproduz o áudio gerado pela IA.
+    Reproduz o áudio gerado.
 
     Args:
-        taxa_amostragem (int): Taxa de amostragem do áudio.
-        dados_audio (numpy.ndarray): Dados de áudio a serem reproduzidos.
+        sample_rate (int): Taxa de amostragem.
+        audio_array (numpy.ndarray): Dados do áudio.
+
+    Returns:
+        None
     """
-    sd.play(dados_audio, taxa_amostragem)
+    sd.play(audio_array, sample_rate)
     sd.wait()
 
 
@@ -107,41 +128,52 @@ if __name__ == "__main__":
         while True:
             console.input("[cyan]Pressione Enter para começar a gravar...")
 
-            fila_dados = Queue()  
-            evento_parar = threading.Event()
-            thread_gravacao = threading.Thread(target=gravar_audio, args=(evento_parar, fila_dados))
-            thread_gravacao.start()
+            data_queue = Queue()
+            stop_event = threading.Event()
+            recording_thread = threading.Thread(
+                target=record_audio,
+                args=(stop_event, data_queue),
+            )
+            recording_thread.start()
 
-            input()  # Aguarda o usuário pressionar Enter para interromper a gravação
-            evento_parar.set()
-            thread_gravacao.join()
+            input()  # Aguarda o usuário pressionar Enter para parar a gravação
+            stop_event.set()
+            recording_thread.join()
 
-            dados_audio = b"".join(list(fila_dados.queue))
-            audio_np = np.frombuffer(dados_audio, dtype=np.int16).astype(np.float32) / 32768.0
+            audio_data = b"".join(list(data_queue.queue))
+            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
             if audio_np.size > 0:
                 with console.status("🔊 Transcrevendo...", spinner="earth"):
-                    inicio_tempo = time.time()
-                    texto = transcrever(audio_np)
-                    console.print(f"Tempo para transcrever: {time.time() - inicio_tempo:.2f} segundos")
-                console.print(f"[yellow]Você disse: {texto}")
+                    start_time = time.time()
+                    text = transcribe(audio_np)
+                    console.print(f"Tempo para transcrever: {time.time() - start_time:.2f} segundos")
+                console.print(f"[yellow]Você disse: {text}")
+
+                # 🔹 Verifica se há um comando especial
+                if any(cmd in text.lower() for cmd in COMANDOS.keys()):
+                    comando_detectado = next(cmd for cmd in COMANDOS.keys() if cmd in text.lower())
+                    console.print(f"[green]Executando comando: {comando_detectado}...")
+                    if executar_comando(comando_detectado):
+                        time.sleep(1)  # Tempo para abrir o bloco de notas
+                    continue  # Pula a geração de resposta normal
 
                 with console.status("Gerando resposta...", spinner="earth"):
-                    inicio_tempo = time.time()
-                    resposta = gerar_resposta_ia(texto)
-                    console.print(f"Tempo para gerar resposta: {time.time() - inicio_tempo:.2f} segundos")
+                    start_time = time.time()
+                    response = get_llm_response(text)
+                    console.print(f"Tempo para gerar resposta: {time.time() - start_time:.2f} segundos")
 
                 with console.status("Sintetizando áudio...", spinner="earth"):
-                    inicio_tempo = time.time()
-                    taxa_amostragem, dados_audio = tts.sintetizar(resposta)
-                    console.print(f"Tempo para gerar áudio: {time.time() - inicio_tempo:.2f} segundos")
+                    start_time = time.time()
+                    sample_rate, audio_array = tts.sintetizar(response)
+                    console.print(f"Tempo para gerar áudio: {time.time() - start_time:.2f} segundos")
 
-                console.print(f"[cyan]Jarvis: {resposta}")
-                reproduzir_audio(taxa_amostragem, dados_audio)
+                console.print(f"[cyan]Jarvis: {response}")
+                play_audio(sample_rate, audio_array)
             else:
                 console.print("[red]Nenhum áudio capturado. Verifique o microfone.")
 
     except KeyboardInterrupt:
-        console.print("\n[red]Encerrando assistente...")
+        console.print("\n[red]Saindo...")
 
-    console.print("[blue]Sessão finalizada.")
+    console.print("[blue]Sessão encerrada.")
